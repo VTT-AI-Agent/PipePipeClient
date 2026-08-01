@@ -20,6 +20,20 @@ import java.net.UnknownHostException
 internal class SabrDownloader(
     private val mission: DownloadMission,
 ) : Runnable {
+
+    /**
+     * The *shared* provider, not a fresh instance.
+     *
+     * Playback goes through `LocalDomPoTokenProvider.shared(...)` (see
+     * `SabrSessionStore.provider()`), which owns the warmed local-DOM generator, the minted
+     * session PO token, the cached visitorData and the credential state. Constructing a private
+     * instance here gave downloads a cold provider with none of that, which spun up a second
+     * generator alongside the player's and produced a token YouTube rejected with
+     * `StreamProtectionStatus = ATTESTATION_REQUIRED`.
+     */
+    private val poTokenProvider: LocalDomPoTokenProvider
+        get() = LocalDomPoTokenProvider.shared(mission.context)
+
     override fun run() {
         try {
             ensureRunning()
@@ -38,6 +52,7 @@ internal class SabrDownloader(
             prepareMission(expectedLength)
             var coldStartAttempts = 0
             var transientAttempts = 0
+            var attestationAttempts = 0
             var refreshInfo = false
             while (true) {
                 try {
@@ -59,6 +74,22 @@ internal class SabrDownloader(
                     logDebug("retry cold start attempt=$coldStartAttempts")
                     refreshInfo = true
                 } catch (error: Exception) {
+                    // YouTube rejected the PO token we attached (a stale one from the disk cache
+                    // will do it). Throw the cached token away, force a fresh mint and try once
+                    // more, mirroring "refresh SABR attestation after token rejection" on the
+                    // playback side.
+                    if (isAttestationRejection(error)
+                        && attestationAttempts < MAX_ATTESTATION_RETRIES
+                    ) {
+                        attestationAttempts++
+                        runCatching { poTokenProvider.clearCachedToken(info.videoId) }
+                        logDebug(
+                            "attestation rejected, re-minting PO token " +
+                                "attempt=$attestationAttempts",
+                        )
+                        refreshInfo = true
+                        continue
+                    }
                     if (!isRetryableAttemptFailure(error)) {
                         throw error
                     }
@@ -90,7 +121,6 @@ internal class SabrDownloader(
         recoveries: Array<MissionRecoveryInfo>,
         coldStartAttempt: Int,
     ) {
-        val poTokenProvider = LocalDomPoTokenProvider(mission.context)
         val session = YoutubeSabrSession(
             info,
             SabrDownloadFormatResolver.selectedAudioFormat(info, recoveries),
@@ -521,6 +551,20 @@ internal class SabrDownloader(
             message.contains("not returned", ignoreCase = true)
     }
 
+    /** Whether this failure is YouTube telling us the PO token we sent wasn't good enough. */
+    private fun isAttestationRejection(error: Throwable?): Boolean {
+        var current = error
+        var depth = 0
+        while (current != null && depth < 8) {
+            if (current.message?.contains("attestation required", ignoreCase = true) == true) {
+                return true
+            }
+            current = current.cause
+            depth++
+        }
+        return false
+    }
+
     /**
      * Mints a PO token and attaches it to the session's stream state *before* any segment is
      * requested, exactly as the player does in `SabrSessionStore.attachPoToken()`.
@@ -576,6 +620,7 @@ internal class SabrDownloader(
         private const val MAX_EMPTY_RESPONSES = 60
         private const val MAX_COLD_START_RETRIES = 3
         private const val MAX_TRANSIENT_RETRIES = 5
+        private const val MAX_ATTESTATION_RETRIES = 2
         private const val MAX_TRANSIENT_RETRY_DELAY_MS = 5_000L
         private const val MAX_SESSION_CACHE_BYTES = 48L * 1024L * 1024L
         private const val MAX_INITIALIZATION_BYTES = 16 * 1024 * 1024
