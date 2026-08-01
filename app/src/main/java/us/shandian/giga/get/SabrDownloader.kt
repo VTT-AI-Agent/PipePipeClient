@@ -82,11 +82,21 @@ internal class SabrDownloader(
                         && attestationAttempts < MAX_ATTESTATION_RETRIES
                     ) {
                         attestationAttempts++
-                        runCatching { poTokenProvider.clearCachedToken(info.videoId) }
-                        logDebug(
-                            "attestation rejected, re-minting PO token " +
-                                "attempt=$attestationAttempts",
-                        )
+                        // Tear down the generator too, not just the cached token: re-minting from
+                        // the same warm generator hands back an equally stale token, which is why
+                        // a plain re-mint didn't recover a session rejected mid-download.
+                        runCatching { poTokenProvider.invalidateAttestation(info.videoId) }
+                        val message = "attestation rejected mid-session at done=${mission.done}" +
+                            " bytes - re-minting PO token, attempt=$attestationAttempts" +
+                            "/$MAX_ATTESTATION_RETRIES"
+                        logDebug(message)
+                        // Also to the cache debug log: this is the one place a user can see it.
+                        runCatching {
+                            org.schabi.newpipe.local.cache.CacheLogger.w(
+                                mission.context, TAG, message,
+                            )
+                        }
+                        Thread.sleep(ATTESTATION_RETRY_DELAY_MS)
                         refreshInfo = true
                         continue
                     }
@@ -620,7 +630,8 @@ internal class SabrDownloader(
         private const val MAX_EMPTY_RESPONSES = 60
         private const val MAX_COLD_START_RETRIES = 3
         private const val MAX_TRANSIENT_RETRIES = 5
-        private const val MAX_ATTESTATION_RETRIES = 2
+        private const val MAX_ATTESTATION_RETRIES = 5
+        private const val ATTESTATION_RETRY_DELAY_MS = 1_500L
         private const val MAX_TRANSIENT_RETRY_DELAY_MS = 5_000L
         private const val MAX_SESSION_CACHE_BYTES = 48L * 1024L * 1024L
         private const val MAX_INITIALIZATION_BYTES = 16 * 1024 * 1024

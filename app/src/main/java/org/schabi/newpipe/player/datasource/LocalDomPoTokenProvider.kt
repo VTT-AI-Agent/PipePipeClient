@@ -437,6 +437,26 @@ class LocalDomPoTokenProvider(context: Context) :
         return currentCredentialIdentity(ServiceList.YouTube.hasTokens()) == credentialIdentity
     }
 
+    /**
+     * Drops the cached PO token for [videoId] *and* tears down the local-DOM generator, so the
+     * next mint starts from a fresh attestation rather than the same warm generator that just
+     * produced a token YouTube refused.
+     *
+     * Used when a SABR session is rejected with `StreamProtectionStatus = ATTESTATION_REQUIRED`:
+     * clearing only the token cache re-mints from the stale generator and tends to hand back an
+     * equally stale token, which is why a plain re-mint didn't recover the session.
+     */
+    fun invalidateAttestation(videoId: String) {
+        clearCachedToken(videoId)
+        synchronized(generatorLock) {
+            generator?.let { mainHandler.post { it.close() } }
+            generator = null
+            generatorContext = null
+            generatorCredentialIdentity = null
+        }
+        Log.i(TAG, "attestation invalidated video=$videoId")
+    }
+
     private fun invalidateCredentialBoundState() {
         sessionPoTokenPrewarmer.cancel()
         prewarmExecutor.execute {
