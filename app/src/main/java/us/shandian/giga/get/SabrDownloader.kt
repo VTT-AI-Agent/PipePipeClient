@@ -90,13 +90,15 @@ internal class SabrDownloader(
         recoveries: Array<MissionRecoveryInfo>,
         coldStartAttempt: Int,
     ) {
+        val poTokenProvider = LocalDomPoTokenProvider(mission.context)
         val session = YoutubeSabrSession(
             info,
             SabrDownloadFormatResolver.selectedAudioFormat(info, recoveries),
             SabrDownloadFormatResolver.selectedVideoFormat(info, recoveries),
-            LocalDomPoTokenProvider(mission.context),
+            poTokenProvider,
             null,
         )
+        attachPoToken(poTokenProvider, info, session)
         val workDir = prepareWorkDirectory()
         val targets = SabrDownloadFormatResolver.buildTargets(info, recoveries, workDir)
         restoreTargets(targets)
@@ -517,6 +519,49 @@ internal class SabrDownloader(
         }
         return message.contains("policy-only", ignoreCase = true) ||
             message.contains("not returned", ignoreCase = true)
+    }
+
+    /**
+     * Mints a PO token and attaches it to the session's stream state *before* any segment is
+     * requested, exactly as the player does in `SabrSessionStore.attachPoToken()`.
+     *
+     * Passing a [org.schabi.newpipe.extractor.services.youtube.sabr.SabrPoTokenProvider] to the
+     * session constructor is not enough on its own: YouTube expects the very first SABR request
+     * of a session to already carry proof of attestation, and when it doesn't the server answers
+     * with a no-media response whose `attestationRequired` flag makes
+     * `BuiltinSabrSessionPolicy` fail the session outright ("SABR attestation required"). That is
+     * why SABR downloads failed while SABR playback worked - playback attaches the token up
+     * front, downloads never did.
+     */
+    @Throws(IOException::class)
+    private fun attachPoToken(
+        provider: LocalDomPoTokenProvider,
+        info: YoutubeSabrInfo,
+        session: YoutubeSabrSession,
+    ) {
+        val token = try {
+            provider.getPoToken(info, session.streamState)
+        } catch (error: InterruptedException) {
+            throw error
+        } catch (error: Exception) {
+            throw SabrDownloadException(
+                SabrDownloadException.Reason.INITIALIZATION,
+                "SABR download failed: could not obtain the PO token YouTube requires "
+                    + "(attestation) for video=${info.videoId}",
+                error,
+            )
+        }
+        if (token == null || token.isEmpty()) {
+            throw SabrDownloadException(
+                SabrDownloadException.Reason.INITIALIZATION,
+                "SABR download failed: PO token provider returned no token for "
+                    + "video=${info.videoId}",
+                null,
+            )
+        }
+        session.streamState.setPoToken(token)
+        session.addDiagnosticEvent("token_attach bytes=${token.size}")
+        logDebug("attached PO token bytes=${token.size} video=${info.videoId}")
     }
 
     private fun logDebug(message: String) {
